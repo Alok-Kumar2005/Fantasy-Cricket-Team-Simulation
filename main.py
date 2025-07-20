@@ -1,227 +1,228 @@
 import pandas as pd
 import numpy as np
 import random
-from collections import defaultdict
+import itertools
 import os
-
+import time
+from collections import defaultdict
+from tqdm import tqdm
 
 def load_player_data(filepath):
-    """
-    Load csv data of players
-    """
     try:
         df = pd.read_csv(filepath)
-        print(f"loded df with shape {df.shape} ")
+        print(f"Loaded player data with shape {df.shape}")
         return df
     except FileNotFoundError:
         print(f"Error: File {filepath} not found")
         return None
-    
-def create_weighted_player_pool(player_df):
-    """
-    Creating weighted pool for each category of players
-    """
-    role_pools = {}
-    
-    for role in player_df['role'].unique():
-        role_players = player_df[player_df['role'] == role].copy()
-        
-        ###  Creating weighted selection as per perc_selection
-        players_list = []
-        weights_list = []
-        
-        for _, player in role_players.iterrows():
-            players_list.append(player)
-            weights_list.append(player['perc_selection'])
-        
-        role_pools[role] = {
-            'players': players_list,
-            'weights': weights_list
-        }
-    
-    return role_pools
 
+def generate_valid_teams(player_df):
+    """Generate all valid teams that meet role constraints"""
+    # Create player role mapping
+    player_roles = {}
+    for _, row in player_df.iterrows():
+        player_roles[row['player_code']] = row['role']
+    
+    all_players = list(player_df['player_code'])
+    required_roles = {'Batsman', 'Bowler', 'WK', 'Allrounder'}
+    
+    valid_teams = []
+    # Generate all combinations of 11 players
+    all_combinations = list(itertools.combinations(all_players, 11))
+    
+    for comb in all_combinations:
+        roles_present = set()
+        for player in comb:
+            roles_present.add(player_roles[player])
+        # Check if all required roles are present
+        if required_roles.issubset(roles_present):
+            valid_teams.append(tuple(sorted(comb)))
+    
+    print(f"Generated {len(valid_teams)} valid teams")
+    return valid_teams
 
-def generate_single_team(role_pools, team_id, player_df):
-    """
-    getting single teams with all roles
-    """
-    selected_players = []
-    selected_codes = set()  # to store unique
+def evaluate_accuracy(current_counts, target_counts, total_teams):
+    """Evaluate how many players are within 5% error"""
+    within = 0
+    for player in current_counts:
+        target_perc = target_counts[player] / total_teams
+        actual_perc = current_counts[player] / total_teams
+        if target_perc == 0:
+            error = 0 if actual_perc == 0 else float('inf')
+        else:
+            error = (actual_perc - target_perc) / target_perc
+        if abs(error) <= 0.05:
+            within += 1
+    return within
 
-    required_roles = ['WK', 'Batsman', 'Bowler', 'Allrounder']
+def select_teams_greedy(valid_teams, target_counts, num_teams=20000):
+    """Enhanced greedy team selection to minimize squared error"""
+    # Initialize counts
+    all_players = list(target_counts.keys())
+    current_counts = {player: 0 for player in all_players}
+    selected_teams = []
+    selected_set = set()
     
-    # to maintain the requirement, at least 1 player from required roles
-    # selecting one from each categories
-    for role in required_roles:
-        if role not in role_pools:
-            continue
+    # Precompute target squared for constant term in loss
+    target_sq = sum(target_counts[p]**2 for p in all_players)
+    
+    # Shuffle valid teams to introduce randomness
+    random.shuffle(valid_teams)
+    
+    # Precompute player-team membership
+    player_teams = defaultdict(list)
+    for team in valid_teams:
+        for player in team:
+            player_teams[player].append(team)
+    
+    # Initialize deficit tracking
+    deficit_history = []
+    min_deficit = float('inf')
+    
+    # Start timer
+    start_time = time.time()
+    pbar = tqdm(total=num_teams, desc="Generating teams")
+    
+    for i in range(num_teams):
+        # Calculate current deficit
+        total_deficit = 0
+        for player in all_players:
+            deficit = max(0, target_counts[player] - current_counts[player])
+            total_deficit += deficit
+        deficit_history.append(total_deficit)
+        
+        # Track minimum deficit
+        if total_deficit < min_deficit:
+            min_deficit = total_deficit
+        
+        # Check progress every 1000 teams
+        if i % 1000 == 0:
+            # Calculate current loss
+            loss = 0
+            for p in all_players:
+                diff = current_counts[p] - target_counts[p]
+                loss += diff * diff
+            within = evaluate_accuracy(current_counts, target_counts, i+1)
             
-        pool = role_pools[role]
-        
-        # filtering already selected players
-        available_indices = []
-        available_weights = []
-        
-        for i, player in enumerate(pool['players']):
-            if player['player_code'] not in selected_codes:
-                available_indices.append(i)
-                available_weights.append(pool['weights'][i])
-        
-        if available_indices and available_weights:
-            # Normalize weights
-            weights_array = np.array(available_weights)
-            weights_array = weights_array / weights_array.sum()
+            # Early stopping if accuracy target is met
+            if within >= 20:
+                print(f"\nAccuracy target met at team {i+1}")
+                break
             
-            # Select random index
-            selected_idx = np.random.choice(available_indices, p=weights_array)
-            selected_player = pool['players'][selected_idx]
+            # Dynamic candidate pool sizing based on deficit
+            candidate_pool_size = min(5000, max(1000, int(5000 * (total_deficit / min_deficit))))
+            pbar.set_description(f"Teams: {i+1}, Loss: {loss}, Within±5%: {within}, Candidates: {candidate_pool_size}")
+        
+        # Find under-sampled players
+        under_sampled = [p for p in all_players if current_counts[p] < target_counts[p]]
+        
+        # If we have under-sampled players, focus on the most deficient ones
+        if under_sampled:
+            # Sort by deficit (largest deficit first)
+            under_sampled.sort(key=lambda p: target_counts[p] - current_counts[p], reverse=True)
             
-            selected_players.append(selected_player)
-            selected_codes.add(selected_player['player_code'])
-    
-    # now selecting rest of 7 players from remaining
-    while len(selected_players) < 11:
-        all_available_indices = []
-        all_available_weights = []
-        all_players = []
-        
-        for role in role_pools:
-            pool = role_pools[role]
-            for i, player in enumerate(pool['players']):
-                if player['player_code'] not in selected_codes:
-                    all_available_indices.append(len(all_players))
-                    all_available_weights.append(pool['weights'][i])
-                    all_players.append(player)
-        
-        if not all_players:
-            break
+            # Focus on the top 5 most deficient players
+            focus_players = under_sampled[:min(5, len(under_sampled))]
             
-        # Normalize weights
-        weights_array = np.array(all_available_weights)
-        weights_array = weights_array / weights_array.sum()
-        
-        # Select random player
-        selected_idx = np.random.choice(all_available_indices, p=weights_array)
-        selected_player = all_players[selected_idx]
-        
-        selected_players.append(selected_player)
-        selected_codes.add(selected_player['player_code'])
-    
-    team_data = []
-    for player in selected_players:
-        team_data.append({
-            'match_code': player['match_code'],
-            'player_code': player['player_code'],
-            'player_name': player['player_name'],
-            'role': player['role'],
-            'team': player['team'],
-            'perc_selection': player['perc_selection'],
-            'team_id': team_id
-        })
-    
-    return pd.DataFrame(team_data)
-
-
-
-def adjust_selection_probabilities(role_pools, target_counts, current_counts, total_teams_remaining):
-    """
-    Dynamically adjust probabilities to meet target frequencies
-    """
-    adjusted_pools = {}
-    
-    for role in role_pools:
-        adjusted_pools[role] = {
-            'players': role_pools[role]['players'].copy(),
-            'weights': []
-        }
-        
-        for i, player in enumerate(role_pools[role]['players']):
-            player_code = player['player_code']
-            
-            target = target_counts[player_code]
-            current = current_counts[player_code]
-            remaining_need = max(0, target - current)
-            
-            ### Adjusting weight based on remaining need
-            if total_teams_remaining > 0:
-                adjusted_weight = remaining_need / total_teams_remaining
-                ### minimum weight to avoid zero probabilities
-                adjusted_weight = max(adjusted_weight, 0.001)
-            else:
-                adjusted_weight = role_pools[role]['weights'][i]
-            
-            adjusted_pools[role]['weights'].append(adjusted_weight)
-    
-    return adjusted_pools
-
-
-def generate_teams(player_df, num_teams=20000):
-    """
-    Generating fantasy teams 
-    """
-    print("Generating Teams")
-    ### claculating target count for each player
-    target_counts = {}
-    for _, player in player_df.iterrows():
-        target_counts[player['player_code']] = int(player['perc_selection'] * num_teams)
-    
-    current_counts = defaultdict(int)
-    all_teams = []
-    unique_teams = set()
-    
-    ## Creating initial role pools
-    role_pools = create_weighted_player_pool(player_df)
-    
-    team_id = 1
-    attempts = 0
-    max_attempts = num_teams * 3  ## these will prevent to infine loop 
-    
-    progress_interval = num_teams // 20
-    
-    while len(all_teams) < num_teams and attempts < max_attempts:
-        attempts += 1
-        
-        ### Adjust probability after generating 1000 teams
-        if len(all_teams) > 0 and len(all_teams) % 1000 == 0:
-            remaining_teams = num_teams - len(all_teams)
-            role_pools = adjust_selection_probabilities(
-                create_weighted_player_pool(player_df), 
-                target_counts, 
-                current_counts, 
-                remaining_teams
-            )
-        
-        ### Generating  a unique tema using generate_single_team fnction 
-        team_df = generate_single_team(role_pools, team_id, player_df)
-        
-        if len(team_df) == 11:
-            ### checking for unique team
-            team_signature = tuple(sorted(team_df['player_code'].tolist()))
-            
-            if team_signature not in unique_teams:
-                unique_teams.add(team_signature)
-                all_teams.append(team_df)
+            # Collect candidate teams containing these focus players
+            candidates = []
+            for player in focus_players:
+                # Get teams containing this player
+                teams_for_player = player_teams[player]
                 
-                for player_code in team_df['player_code']:
-                    current_counts[player_code] += 1
+                # Filter out already selected teams
+                available_teams = [t for t in teams_for_player if t not in selected_set]
                 
-                team_id += 1
+                # Sample a subset if too many
+                if len(available_teams) > 1000:
+                    candidates.extend(random.sample(available_teams, 1000))
+                else:
+                    candidates.extend(available_teams)
+            
+            # Remove duplicates
+            candidates = list(set(candidates))
+        else:
+            # If no under-sampled, use random candidates
+            candidates = [t for t in valid_teams if t not in selected_set]
+        
+        # If we have too many candidates, sample a subset
+        if len(candidates) > 5000:
+            candidates = random.sample(candidates, 5000)
+        
+        best_team = None
+        best_score = float('-inf')
+        
+        # Evaluate candidates based on deficit reduction potential
+        for team in candidates:
+            if team in selected_set:
+                continue
                 
-                if len(all_teams) % progress_interval == 0:
-                    print("", end="", flush=True)
+            # Calculate potential new counts
+            temp_counts = current_counts.copy()
+            for p in team:
+                temp_counts[p] += 1
+                
+            # Calculate the improvement score
+            score = 0
+            for p in all_players:
+                current_deficit = max(0, target_counts[p] - current_counts[p])
+                new_deficit = max(0, target_counts[p] - temp_counts[p])
+                improvement = current_deficit - new_deficit
+                
+                # Weight improvement by how under-sampled the player is
+                if current_deficit > 0:
+                    weight = 1 + (current_deficit / target_counts[p])
+                    score += improvement * weight
+            
+            if score > best_score:
+                best_score = score
+                best_team = team
+                
+        # Select the best team
+        if best_team is None:
+            # Fallback to random selection
+            while True:
+                team = random.choice(valid_teams)
+                if team not in selected_set:
+                    best_team = team
+                    break
+        
+        # Update counts and add team
+        for p in best_team:
+            current_counts[p] += 1
+        selected_teams.append(best_team)
+        selected_set.add(best_team)
+        pbar.update(1)
     
-    print(f"Generated {len(all_teams)} unique teams in {attempts} attempts")
+    pbar.close()
+    print(f"Team selection completed in {time.time()-start_time:.2f} seconds")
+    return selected_teams, current_counts
+
+def build_team_df(selected_teams, player_df):
+    """Build final team DataFrame"""
+    player_map = {}
+    for _, row in player_df.iterrows():
+        player_map[row['player_code']] = row
     
-    ### combining all teams
-    final_df = pd.concat(all_teams, ignore_index=True)
-    return final_df
+    rows = []
+    for team_id, team in enumerate(selected_teams, 1):
+        for player_code in team:
+            player_info = player_map[player_code]
+            rows.append({
+                'match_code': player_info['match_code'],
+                'player_code': player_code,
+                'player_name': player_info['player_name'],
+                'role': player_info['role'],
+                'team': player_info['team'],
+                'perc_selection': player_info['perc_selection'],
+                'team_id': team_id
+            })
+    
+    return pd.DataFrame(rows)
 
-
-### Evaluaing metrics as per given
 def evaluate_team_accuracy(team_df):
+    """Evaluation function provided in the problem statement"""
     print("🔍 Evaluating Fantasy Team Accuracy...\n")
-
     print(f"📐 team_df shape: {team_df.shape}")
     total_teams = team_df['team_id'].nunique()
     total_players = team_df['player_code'].nunique()
@@ -276,19 +277,38 @@ def evaluate_team_accuracy(team_df):
 
     return accuracy_df
 
-
 def main():
     os.makedirs("output", exist_ok=True)
     player_df = load_player_data("data/player_data_sample.csv")
     if player_df is None:
         return
-
-    np.random.seed(42)
-    random.seed(42)
-    team_df = generate_teams(player_df, num_teams=20000)
-    team_df.to_csv("output/team_df.csv", index=False)
-    print(f"shape of combeined teams: {team_df.shape}\n")
     
+    # Set random seeds for reproducibility
+    random.seed(42)
+    np.random.seed(42)
+    
+    # Step 1: Generate all valid teams
+    print("Generating all valid teams...")
+    start_time = time.time()
+    valid_teams = generate_valid_teams(player_df)
+    print(f"Generated valid teams in {time.time()-start_time:.2f} seconds")
+    
+    # Step 2: Set target counts
+    target_counts = {}
+    for _, row in player_df.iterrows():
+        target_counts[row['player_code']] = round(row['perc_selection'] * 20000)
+    
+    # Step 3: Select teams using enhanced greedy algorithm
+    print("Selecting teams with enhanced greedy optimization...")
+    selected_teams, final_counts = select_teams_greedy(valid_teams, target_counts)
+    
+    # Step 4: Build final DataFrame
+    print("Building final team DataFrame...")
+    team_df = build_team_df(selected_teams, player_df)
+    team_df.to_csv("output/team_df.csv", index=False)
+    print(f"Saved team data with shape {team_df.shape}")
+    
+    # Step 5: Evaluate accuracy
     accuracy_df = evaluate_team_accuracy(team_df)
 
 if __name__ == "__main__":
